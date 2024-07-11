@@ -16,6 +16,13 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
+# Example render function (replace this with your actual render function)
+def example_render_function():
+    # Generate a simple gradient image for demonstration
+    width, height = 400, 300
+    gradient = np.linspace(0, 255, width * height).reshape(height, width).astype(np.uint8)
+    return cv2.cvtColor(gradient, cv2.COLOR_GRAY2RGB)  # Convert to RGB format
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, opt, scaling_modifier = 1.0, override_color = None):
     """
     Render the scene. 

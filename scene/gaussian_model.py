@@ -21,6 +21,8 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
+FEATURES = 6
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -97,17 +99,17 @@ class GaussianModel:
     def restore(self, model_args, training_args, mode='train'):
         if len(model_args) == 13: # 这是一个feature训练时保存的ckpt
             (self.active_sh_degree, 
-            self._xyz, 
-            self._features_dc, 
+            self._xyz,
+            self._features_dc,
             self._features_rest,
-            self._scaling, 
-            self._rotation, 
+            self._scaling,
+            self._rotation,
             self._opacity,
             self._language_feature,
-            self.max_radii2D, 
-            xyz_gradient_accum, 
+            self.max_radii2D,
+            xyz_gradient_accum,
             denom,
-            opt_dict, 
+            opt_dict,
             self.spatial_lr_scale) = model_args
         elif len(model_args) == 12: # 这是一个不训练feature保存的ckpt
             (self.active_sh_degree, 
@@ -203,7 +205,7 @@ class GaussianModel:
         if training_args.include_feature:
             if self._language_feature is None or self._language_feature.shape[0] != self._xyz.shape[0]:
                 # 开始feature训练的时候，往模型中加入language feature参数
-                language_feature = torch.zeros((self._xyz.shape[0], 3), device="cuda")
+                language_feature = torch.zeros((self._xyz.shape[0], FEATURES), device="cuda")
                 self._language_feature = nn.Parameter(language_feature.requires_grad_(True))
                 
             l = [

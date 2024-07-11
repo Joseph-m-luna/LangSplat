@@ -8,5 +8,8 @@ data
 tensorboard_3d
 **/__pycache__/
 events.out*
-ckpt
 release
+ckpt/
+__pycache__/
+autoencoder/
+ckpts/

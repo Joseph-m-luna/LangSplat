@@ -13,6 +13,7 @@ from typing import Tuple, Type
 from copy import deepcopy
 
 import torch
+torch.cuda.empty_cache()
 import torchvision
 from torch import nn
 
@@ -20,9 +21,11 @@ try:
     import open_clip
 except ImportError:
     assert False, "open_clip is not installed, install it with `pip install open-clip-torch`"
+
 import multiprocessing as mp
-import time
-import traceback
+import sys
+import time 
+import matplotlib.pyplot as plt
 
 
 @dataclass
@@ -111,44 +114,7 @@ class OpenCLIPNetwork(nn.Module):
 
 
 
-def process_loop(mask_generator, img, image_list, embed_size, i):
-    try:
-        img_embed, seg_map = _embed_clip_sam_tiles(mask_generator, img.unsqueeze(0), sam_encoder)
-    except Exception as e:
-        print("failed")
-        print(e)
-        traceback.print_exc()
-    lengths = [len(v) for k, v in img_embed.items()]
-    total_length = sum(lengths)
-    total_lengths = total_length
-    if total_length > img_embeds.shape[1]:
-        pad = total_length - img_embeds.shape[1]
-        img_embeds = torch.cat([
-            img_embeds,
-            torch.zeros((len(image_list), pad, embed_size))
-        ], dim=1)
-    img_embed = torch.cat([v for k, v in img_embed.items()], dim=0)
-    assert img_embed.shape[0] == total_length
-    img_embeds[i, :total_length] = img_embed
-    
-    seg_map_tensor = []
-    lengths_cumsum = lengths.copy()
-    for j in range(1, len(lengths)):
-        lengths_cumsum[j] += lengths_cumsum[j-1]
-    for j, (k, v) in enumerate(seg_map.items()):
-        if j == 0:
-            seg_map_tensor.append(torch.from_numpy(v))
-            continue
-        assert v.max() == lengths[j] - 1, f"{j}, {v.max()}, {lengths[j]-1}"
-        v[v != -1] += lengths_cumsum[j-1]
-        seg_map_tensor.append(torch.from_numpy(v))
-    seg_map = torch.stack(seg_map_tensor, dim=0)
-    seg_maps = seg_map
-    print(f"done with {i}")
-    return seg_map, total_lengths, i
 
-def all_done(async_results):
-    return all(result.ready() for result in async_results)
 
 def create(image_list, data_list, save_folder):
     assert image_list is not None, "image_list must be provided to generate features"
@@ -160,21 +126,42 @@ def create(image_list, data_list, save_folder):
     seg_maps = torch.zeros((len(image_list), 4, *image_list[0].shape[1:])) 
     mask_generator.predictor.model.to('cuda')
 
-    mp.set_start_method("spawn")
-    pool = mp.Pool(3)
-    processes = []
-    for i, img in enumerate(image_list):
+    for i, img in tqdm(enumerate(image_list), desc="Embedding images", leave=False):
+        timer += 1
+        try:
+            img_embed, seg_map = _embed_clip_sam_tiles(img.unsqueeze(0), sam_encoder)
+        except:
+            raise ValueError(timer)
+
+        lengths = [len(v) for k, v in img_embed.items()]
+        total_length = sum(lengths)
+        total_lengths.append(total_length)
         
-        processes.append(pool.apply_async(process_loop, args = (mask_generator, img, image_list, embed_size, i)))
-        print(f"done with {i}")
+        if total_length > img_embeds.shape[1]:
+            pad = total_length - img_embeds.shape[1]
+            img_embeds = torch.cat([
+                img_embeds,
+                torch.zeros((len(image_list), pad, embed_size))
+            ], dim=1)
 
+        img_embed = torch.cat([v for k, v in img_embed.items()], dim=0)
+        assert img_embed.shape[0] == total_length
+        img_embeds[i, :total_length] = img_embed
+        
+        seg_map_tensor = []
+        lengths_cumsum = lengths.copy()
+        for j in range(1, len(lengths)):
+            lengths_cumsum[j] += lengths_cumsum[j-1]
+        for j, (k, v) in enumerate(seg_map.items()):
+            if j == 0:
+                seg_map_tensor.append(torch.from_numpy(v))
+                continue
+            assert v.max() == lengths[j] - 1, f"{j}, {v.max()}, {lengths[j]-1}"
+            v[v != -1] += lengths_cumsum[j-1]
+            seg_map_tensor.append(torch.from_numpy(v))
+        seg_map = torch.stack(seg_map_tensor, dim=0)
+        seg_maps[i] = seg_map
 
-    while not all_done(processes):
-        time.sleep(1)
-    pool.close()
-    pool.join()
-    print("done")
-    print(processes[0].ready())
     mask_generator.predictor.model.to('cpu')
         
     for i in range(img_embeds.shape[0]):
@@ -192,9 +179,9 @@ def sava_numpy(save_path, data):
     np.save(save_path_s, data['seg_maps'].numpy())
     np.save(save_path_f, data['feature'].numpy())
 
-def _embed_clip_sam_tiles(mask_generator, image, sam_encoder):
+def _embed_clip_sam_tiles(image, sam_encoder):
     aug_imgs = torch.cat([image])
-    seg_images, seg_map = sam_encoder(mask_generator, aug_imgs)
+    seg_images, seg_map = sam_encoder(aug_imgs)
 
     clip_embeds = {}
     for mode in ['default', 's', 'm', 'l']:
@@ -231,6 +218,26 @@ def filter(keep: torch.Tensor, masks_result) -> None:
         if i in keep: result_keep.append(m)
     return result_keep
 
+def job(masks_ord, iou_matrix, masks_area, inner_iou_matrix, i, j):
+    intersection = torch.sum(torch.logical_and(masks_ord[i], masks_ord[j]), dtype=torch.float)
+
+    if intersection == 0:
+        iou_matrix[i, j] = 0
+    else:
+        union = torch.sum(torch.logical_or(masks_ord[i], masks_ord[j]), dtype=torch.float)
+        iou = intersection / union
+        iou_matrix[i, j] = iou
+        # select mask pairs that may have a severe internal relationship
+        if intersection / masks_area[i] < 0.5 and intersection / masks_area[j] >= 0.85:
+            inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
+            inner_iou_matrix[i, j] = inner_iou
+        if intersection / masks_area[i] >= 0.85 and intersection / masks_area[j] < 0.5:
+            inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
+            inner_iou_matrix[j, i] = inner_iou
+
+def all_done(async_results):
+    return all(result.ready() for result in async_results)
+
 def mask_nms(masks, scores, iou_thr=0.7, score_thr=0.1, inner_thr=0.2, **kwargs):
     """
     Perform mask non-maximum suppression (NMS) on a set of masks based on their scores.
@@ -249,24 +256,37 @@ def mask_nms(masks, scores, iou_thr=0.7, score_thr=0.1, inner_thr=0.2, **kwargs)
     scores, idx = scores.sort(0, descending=True)
     num_masks = idx.shape[0]
     
-    masks_ord = masks[idx.view(-1), :]
+    masks_ord = masks[idx.view(-1), :].cuda()
     masks_area = torch.sum(masks_ord, dim=(1, 2), dtype=torch.float)
 
     iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
     inner_iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
+
+    results = []
+    #pool = mp.Pool(10)
+    
     for i in range(num_masks):
         for j in range(i, num_masks):
             intersection = torch.sum(torch.logical_and(masks_ord[i], masks_ord[j]), dtype=torch.float)
-            union = torch.sum(torch.logical_or(masks_ord[i], masks_ord[j]), dtype=torch.float)
-            iou = intersection / union
-            iou_matrix[i, j] = iou
-            # select mask pairs that may have a severe internal relationship
-            if intersection / masks_area[i] < 0.5 and intersection / masks_area[j] >= 0.85:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
-                inner_iou_matrix[i, j] = inner_iou
-            if intersection / masks_area[i] >= 0.85 and intersection / masks_area[j] < 0.5:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
-                inner_iou_matrix[j, i] = inner_iou
+
+            if intersection == 0:
+                iou_matrix[i, j] = 0
+            else:
+                union = torch.sum(torch.logical_or(masks_ord[i], masks_ord[j]), dtype=torch.float)
+                iou = intersection / union
+                iou_matrix[i, j] = iou
+                # select mask pairs that may have a severe internal relationship
+                if intersection / masks_area[i] < 0.5 and intersection / masks_area[j] >= 0.85:
+                    inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
+                    inner_iou_matrix[i, j] = inner_iou
+                if intersection / masks_area[i] >= 0.85 and intersection / masks_area[j] < 0.5:
+                    inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
+                    inner_iou_matrix[j, i] = inner_iou
+            #job(masks_ord, iou_matrix, masks_area, inner_iou_matrix, i, j)
+            #results.append(pool.apply_async(job, (masks_ord, iou_matrix, masks_area, inner_iou_matrix, i, j)))
+    #pool.close()
+    #pool.join()
+    
 
     iou_matrix.triu_(diagonal=1)
     iou_max, _ = iou_matrix.max(dim=0)
@@ -300,22 +320,31 @@ def mask_nms(masks, scores, iou_thr=0.7, score_thr=0.1, inner_thr=0.2, **kwargs)
 def masks_update(*args, **kwargs):
     # remove redundant masks based on the scores and overlap rate between masks
     masks_new = ()
+    start_time = time.time()
     for masks_lvl in (args):
         seg_pred =  torch.from_numpy(np.stack([m['segmentation'] for m in masks_lvl], axis=0))
         iou_pred = torch.from_numpy(np.stack([m['predicted_iou'] for m in masks_lvl], axis=0))
         stability = torch.from_numpy(np.stack([m['stability_score'] for m in masks_lvl], axis=0))
 
         scores = stability * iou_pred
+        #slow line start
         keep_mask_nms = mask_nms(seg_pred, scores, **kwargs)
+        #slow line end
         masks_lvl = filter(keep_mask_nms, masks_lvl)
 
         masks_new += (masks_lvl,)
+    dense_time = time.time() - start_time
+    print("NMS time", dense_time)
     return masks_new
 
-def sam_encoder(mask_generator, image):
+def sam_encoder(image):
     image = cv2.cvtColor(image[0].permute(1,2,0).numpy().astype(np.uint8), cv2.COLOR_BGR2RGB)
     # pre-compute masks
+    start_time = time.time()
     masks_default, masks_s, masks_m, masks_l = mask_generator.generate(image)
+    dense_time = time.time() - start_time
+    print()
+    print("Masking time ", dense_time)
     # pre-compute postprocess
     masks_default, masks_s, masks_m, masks_l = \
         masks_update(masks_default, masks_s, masks_m, masks_l, iou_thr=0.8, score_thr=0.7, inner_thr=0.5)
@@ -361,6 +390,8 @@ def seed_everything(seed_value):
 
 
 if __name__ == '__main__':
+    sys.settrace
+    mp.set_start_method("spawn")
     seed_num = 42
     seed_everything(seed_num)
 
