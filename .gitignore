@@ -13,3 +13,4 @@ ckpt/
 __pycache__/
 autoencoder/
 ckpts/
+intermediary.ply
